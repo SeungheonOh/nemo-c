@@ -288,8 +288,8 @@ kernel void layernorm(device const float *X [[buffer(0)]],
 }
 
 /* Relative-position attention: one threadgroup (dh = 128 threads) per (head, query).
-   Q: [c][D], K,V: [L][D], P: [2*Lmax-1][D] position projections (row r <-> relative position (Lmax-1)-r).
-   Thread j < L computes score j; thread d computes output feature d. */
+   Q: [c][ldq], K,V: [L][ldk], P: [2*Lmax-1][D] position projections (row r <-> relative position (Lmax-1)-r).
+   Scores: 4 lanes per key (32 dims each, shuffle-reduced), so 32 keys per pass. Output: thread d. */
 kernel void attention_rel(device const float *Q [[buffer(0)]],
                           device const float *K [[buffer(1)]],
                           device const float *V [[buffer(2)]],
@@ -299,8 +299,11 @@ kernel void attention_rel(device const float *Q [[buffer(0)]],
                           device float *O [[buffer(6)]],
                           constant AttnParams &p [[buffer(7)]],
                           uint2 tg [[threadgroup_position_in_grid]],
-                          uint tid [[thread_index_in_threadgroup]]) {
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float qu[ATT_DH], qv[ATT_DH], s[ATT_MAX_L];
+    threadgroup float red[8];
     const uint h = tg.x, i = tg.y, dh = p.dh, D = p.D, L = p.L, off = h * dh;
     {
         const float q = Q[(ulong)i * p.ldq + off + tid];
@@ -308,28 +311,36 @@ kernel void attention_rel(device const float *Q [[buffer(0)]],
         qv[tid] = q + bias_v[off + tid];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < L) {
-        const uint j = tid;
-        /* relative position = (L - c + i) - j  ->  row in P (window L) = c-1-i+j, shifted by Lmax-L */
-        const uint prow = (p.Lmax - L) + (p.c - 1 - i + j);
-        device const float4 *k4 = (device const float4 *)(K + (ulong)j * p.ldk + off);
-        device const float4 *p4 = (device const float4 *)(P + (ulong)prow * D + off);
-        float a = 0.0f, b = 0.0f;
-        for (uint d4 = 0; d4 < dh / 4; ++d4) {
-            a += dot(float4(qu[4 * d4], qu[4 * d4 + 1], qu[4 * d4 + 2], qu[4 * d4 + 3]), k4[d4]);
-            b += dot(float4(qv[4 * d4], qv[4 * d4 + 1], qv[4 * d4 + 2], qv[4 * d4 + 3]), p4[d4]);
-        }
-        s[j] = (a + b) * p.scale;
+    /* scores: key j = pass*32 + tid/4, this lane covers dims [part*32, part*32+32) */
+    const uint part = tid & 3;
+    for (uint j = tid >> 2; j < L; j += ATT_DH / 4) {
+        const uint prow = (p.Lmax - L) + (p.c - 1 - i + j); /* relative position (L-c+i)-j */
+        device const float4 *k4 = (device const float4 *)(K + (ulong)j * p.ldk + off + part * 32);
+        device const float4 *p4 = (device const float4 *)(P + (ulong)prow * D + off + part * 32);
+        threadgroup const float4 *qu4 = (threadgroup const float4 *)(qu + part * 32);
+        threadgroup const float4 *qv4 = (threadgroup const float4 *)(qv + part * 32);
+        float a = 0.0f;
+        for (uint d4 = 0; d4 < 8; ++d4) a += dot(qu4[d4], k4[d4]) + dot(qv4[d4], p4[d4]);
+        a += simd_shuffle_xor(a, 1);
+        a += simd_shuffle_xor(a, 2);
+        if (part == 0) s[j] = a * p.scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float mx = -INFINITY;
-        for (uint j = 0; j < L; ++j) mx = max(mx, s[j]);
-        float sum = 0.0f;
-        for (uint j = 0; j < L; ++j) { s[j] = exp(s[j] - mx); sum += s[j]; }
-        const float inv = 1.0f / sum;
-        for (uint j = 0; j < L; ++j) s[j] *= inv;
-    }
+    /* softmax over L (<= ATT_MAX_L): threads 0..L-1 hold one score each */
+    float sv = tid < L ? s[tid] : -INFINITY;
+    float mx = simd_max(sv);
+    if (lane == 0) red[sg] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = red[0];
+    for (uint k = 1; k < ATT_DH / 32; ++k) mx = max(mx, red[k]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ev = tid < L ? exp(sv - mx) : 0.0f;
+    float sum = simd_sum(ev);
+    if (lane == 0) red[sg] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0.0f;
+    for (uint k = 0; k < ATT_DH / 32; ++k) sum += red[k];
+    if (tid < L) s[tid] = ev / sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float acc = 0.0f;
     for (uint j = 0; j < L; ++j) acc += s[j] * V[(ulong)j * p.ldk + off + tid];
