@@ -12,6 +12,7 @@ typedef uint32_t u32;
 #define GEMM_SIMDS 8     /* SIMD groups (output columns) per gemm threadgroup: 256 threads */
 #define ATT_DH 128       /* head dim = attention threadgroup size */
 #define JOINT_GROUPS 64  /* threadgroups for joint_partial */
+#define MMA_MIN_ROWS 16  /* activation buffers must hold this many rows for gemm_mma */
 #define ATT_MAX_L 80     /* max attention window (56 cache + 14 chunk, rounded) */
 #define LN_THREADS 256
 #define JOINT_MAX_H 640

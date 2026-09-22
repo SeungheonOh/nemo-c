@@ -40,8 +40,8 @@ encoder_t *encoder_create(model_t *m, int right) {
     e->right = right;
     e->chunk_frames = right + 1;
     e->chunk_mel = e->chunk_frames * m->cfg.subsampling;
-    e->cmax = e->chunk_frames; /* a final partial window can still yield at most chunk_frames+1 rows; give slack */
-    e->cmax += 2;
+    e->cmax = e->chunk_frames + 2; /* a final boundary window can yield up to chunk_frames+2 rows */
+    if (e->cmax < MMA_MIN_ROWS) e->cmax = MMA_MIN_ROWS; /* gemm_mma reads 8 or 16 rows of A */
     e->left = m->cfg.att_left;
     e->Lmax = m->Lmax;
     e->conv_left = m->cfg.conv_kernel - 1;
@@ -147,7 +147,7 @@ static void run_blocks(encoder_t *e, int c) {
         k_gemm(m, t, 0, D, W->wv, D, NULL, e->vc[l], (size_t)e->cache_len * rowb, D, (uint32_t)c, D, D, 0, 0, 1.0f);
         AttnParams ap = { (uint32_t)c, L, (uint32_t)e->Lmax, H, dh, D, 1.0f / sqrtf((float)dh) };
         gpu_arg_t aa[8] = { GPU_BUF(e->q, 0), GPU_BUF(e->kc[l], 0), GPU_BUF(e->vc[l], 0), GPU_BUF(W->ptab, 0), GPU_BUF(W->bias_u, 0), GPU_BUF(W->bias_v, 0), GPU_BUF(e->att, 0), GPU_BYTES(&ap) };
-        gpu_dispatch_groups(m->gpu, "attention_rel", aa, 8, H, (uint32_t)c, 1, ATT_DH, 1, 1);
+        if (!(nemo_skip_mask & 2)) gpu_dispatch_groups(m->gpu, "attention_rel", aa, 8, H, (uint32_t)c, 1, ATT_DH, 1, 1);
         k_gemm(m, e->att, 0, D, W->wo, D, NULL, h, 0, D, (uint32_t)c, D, D, 0, 1, 1.0f);
         /* keep the last `left` rows of k/v as the next cache (through scratch: regions overlap) */
         if ((int)L > e->left) {
@@ -161,10 +161,10 @@ static void run_blocks(encoder_t *e, int c) {
         k_gemm(m, t, 0, D, W->pw1, D, NULL, e->g2, 0, 2 * D, (uint32_t)c, 2 * D, D, 0, 0, 1.0f);
         GluParams gp = { (uint32_t)c, D };
         gpu_arg_t ag[3] = { GPU_BUF(e->g2, 0), GPU_BUF(e->din[l], (size_t)e->conv_left * rowb), GPU_BYTES(&gp) };
-        gpu_dispatch(m->gpu, "glu", ag, 3, D, (uint32_t)c, 1, 256, 1, 1);
+        if (!(nemo_skip_mask & 16)) gpu_dispatch(m->gpu, "glu", ag, 3, D, (uint32_t)c, 1, 256, 1, 1);
         DwParams dp = { (uint32_t)c, D, (uint32_t)m->cfg.conv_kernel, m->cfg.ln_eps };
         gpu_arg_t ad[6] = { GPU_BUF(e->din[l], 0), GPU_BUF(W->dw_w, 0), GPU_BUF(W->bn_g, 0), GPU_BUF(W->bn_b, 0), GPU_BUF(e->y, 0), GPU_BYTES(&dp) };
-        gpu_dispatch_groups(m->gpu, "dwconv_ln_silu", ad, 6, (uint32_t)c, 1, 1, LN_THREADS, 1, 1);
+        if (!(nemo_skip_mask & 16)) gpu_dispatch_groups(m->gpu, "dwconv_ln_silu", ad, 6, (uint32_t)c, 1, 1, LN_THREADS, 1, 1);
         k_gemm(m, e->y, 0, D, W->pw2, D, NULL, h, 0, D, (uint32_t)c, D, D, 0, 1, 1.0f);
         {   /* conv cache = last conv_left rows of din */
             uint32_t n = (uint32_t)e->conv_left * D;
@@ -229,8 +229,7 @@ int encoder_step(encoder_t *e, int final, enc_out_t *out, char *err, size_t errl
     model_t *m = e->m;
     const uint32_t D = (uint32_t)m->cfg.d_model;
     gpu_begin(m->gpu);
-    int T3g = run_pre_encode(e, nwin);
-    (void)T3g;
+    if (!(nemo_skip_mask & 32)) run_pre_encode(e, nwin);
     k_copy(m, e->pre_out, lo * D * sizeof(float), e->h, 0, (uint32_t)c * D);
     run_blocks(e, c);
     if (gpu_end(m->gpu, err, errlen)) return -1;

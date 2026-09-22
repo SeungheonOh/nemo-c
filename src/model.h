@@ -59,6 +59,7 @@ typedef struct model {
     double load_ms;
 } model_t;
 
+extern unsigned nemo_skip_mask; /* NEMO_SKIP: 1 gemm, 2 attention, 4 layernorm, 8 copies, 16 conv module, 32 pre_encode */
 model_t *model_load(const char *dir, char *err, size_t errlen);
 void model_free(model_t *m);
 int model_prompt_index(const model_t *m, const char *lang); /* -1 if unknown */

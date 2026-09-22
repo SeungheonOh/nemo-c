@@ -1,5 +1,6 @@
 #include "model.h"
 #include "kernel_params.h"
+#define MMA_KSTEP_C 32
 #include <dirent.h>
 #include <math.h>
 #include <stdio.h>
@@ -11,6 +12,16 @@ static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+/* Profiling aid: NEMO_SKIP bitmask disables kernel categories (output becomes garbage). */
+unsigned nemo_skip_mask = 0;
+static int skip_init = 0;
+static void skip_setup(void) {
+    if (skip_init) return;
+    skip_init = 1;
+    const char *e = getenv("NEMO_SKIP");
+    if (e) nemo_skip_mask = (unsigned)strtoul(e, NULL, 0);
 }
 
 static char *read_file(const char *path, size_t *len) {
@@ -59,16 +70,34 @@ static gpu_buf_t *get_f32(model_t *m, const char *name, size_t numel, char *err,
 /* ---- kernel launchers ----------------------------------------------------------- */
 void k_gemm(model_t *m, gpu_buf_t *A, size_t a_off, uint32_t lda, wt_t W, uint32_t ldw, gpu_buf_t *bias,
             gpu_buf_t *C, size_t c_off, uint32_t ldc, uint32_t M, uint32_t N, uint32_t K, int act, int accumulate, float alpha) {
+    skip_setup();
+    if (nemo_skip_mask & 1) return;
     GemmParams p = { M, N, K, lda, ldw, ldc, bias != NULL, (uint32_t)act, (uint32_t)accumulate, alpha };
     gpu_arg_t args[5] = { GPU_BUF(A, a_off), GPU_BUF(W.buf, W.off), GPU_BUF(bias ? bias : A, 0), GPU_BUF(C, c_off), GPU_BYTES(&p) };
-    gpu_dispatch_groups(m->gpu, "gemm_bf16", args, 5, (N + GEMM_SIMDS - 1) / GEMM_SIMDS, 1, 1, GEMM_SIMDS * 32, 1, 1);
+    /* Kernel policy from tools/kbench.c against DRAM-resident weights:
+         M <= 4          : gemm_spec, 2 columns per SIMD group (pure weight streaming, ~430 GB/s)
+         4 < M <= 16     : gemm_mma, split-K over 4 SIMD groups, 8x8 matrix units (1.3-2.5x faster than spec)
+         otherwise       : generic gemm_bf16 (subsampling 1x1 convs, position table) */
+    if (M <= 4 || (M <= GEMM_ROWS && (K % (MMA_KSTEP_C * 4)) != 0)) {
+        uint32_t cols = 2;
+        uint32_t fc[3] = { M, cols, 2 };
+        gpu_dispatch_groups_fc(m->gpu, "gemm_spec", fc, 3, args, 5, (N + GEMM_SIMDS * cols - 1) / (GEMM_SIMDS * cols), 1, 1, GEMM_SIMDS * 32, 1, 1);
+    } else if (M <= GEMM_ROWS) {
+        uint32_t ct = (M > 8 && K <= 1024) ? 1 : 2, split = 4;
+        uint32_t fc[6] = { M, 0, 0, M > 8 ? 2u : 1u, ct, split };
+        gpu_dispatch_groups_fc(m->gpu, "gemm_mma", fc, 6, args, 5, (N + 8 * ct - 1) / (8 * ct), 1, 1, 32 * split, 1, 1);
+    } else {
+        gpu_dispatch_groups(m->gpu, "gemm_bf16", args, 5, (N + GEMM_SIMDS - 1) / GEMM_SIMDS, 1, 1, GEMM_SIMDS * 32, 1, 1);
+    }
 }
 void k_layernorm(model_t *m, gpu_buf_t *X, size_t x_off, gpu_buf_t *g, gpu_buf_t *b, gpu_buf_t *Y, size_t y_off, uint32_t M, uint32_t D) {
+    if (nemo_skip_mask & 4) return;
     LnParams p = { M, D, m->cfg.ln_eps };
     gpu_arg_t args[5] = { GPU_BUF(X, x_off), GPU_BUF(g, 0), GPU_BUF(b, 0), GPU_BUF(Y, y_off), GPU_BYTES(&p) };
     gpu_dispatch_groups(m->gpu, "layernorm", args, 5, M, 1, 1, LN_THREADS, 1, 1);
 }
 void k_copy(model_t *m, gpu_buf_t *src, size_t s_off, gpu_buf_t *dst, size_t d_off, uint32_t n) {
+    if (nemo_skip_mask & 8) return;
     CountParams p = { n };
     gpu_arg_t args[3] = { GPU_BUF(src, s_off), GPU_BUF(dst, d_off), GPU_BYTES(&p) };
     gpu_dispatch(m->gpu, "copy_f32", args, 3, n, 1, 1, n < 256 ? n : 256, 1, 1);

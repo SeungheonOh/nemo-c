@@ -106,6 +106,71 @@ kernel void gemm_spec(device const float *A [[buffer(0)]],
     }
 }
 
+/* Split-K MMA GEMM for M <= 16 rows: one threadgroup per block of 8*FC_CT output columns,
+   FC_SPLIT SIMD groups each streaming a K slice through the 8x8 matrix units (bf16 weight
+   tiles converted to float in threadgroup memory), then a threadgroup reduction. A must have
+   at least 8*FC_TM rows allocated (rows >= M are read but never stored). */
+constant uint FC_TM [[function_constant(3)]];
+constant uint FC_CT [[function_constant(4)]];
+constant uint FC_SPLIT [[function_constant(5)]];
+#define MMA_KSTEP 32
+#define MMA_MAXCT 2
+#define MMA_MAXSPLIT 4
+
+kernel void gemm_mma(device const float *A [[buffer(0)]],
+                     device const ushort *W [[buffer(1)]],
+                     device const float *bias [[buffer(2)]],
+                     device float *C [[buffer(3)]],
+                     constant GemmParams &p [[buffer(4)]],
+                     uint g [[threadgroup_position_in_grid]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float wtile[MMA_MAXSPLIT][MMA_MAXCT][8][MMA_KSTEP];
+    threadgroup float red[MMA_MAXSPLIT][2][MMA_MAXCT][8][8];
+    const uint n0 = g * 8 * FC_CT;
+    if (n0 >= p.N) return;
+    simdgroup_float8x8 acc[2][MMA_MAXCT];
+    for (uint tm = 0; tm < FC_TM; ++tm) for (uint ct = 0; ct < FC_CT; ++ct) acc[tm][ct] = simdgroup_float8x8(0.0f);
+    const uint r = lane >> 2, kk = (lane & 3) * 8;
+    const uint kper = p.K / FC_SPLIT, kbeg = sg * kper, kend = kbeg + kper;
+    for (uint k0 = kbeg; k0 < kend; k0 += MMA_KSTEP) {
+        for (uint ct = 0; ct < FC_CT; ++ct) {
+            device const ushort4 *wp = (device const ushort4 *)(W + (ulong)min(n0 + ct * 8 + r, p.N - 1) * p.ldw + k0 + kk);
+            threadgroup float4 *dst = (threadgroup float4 *)&wtile[sg][ct][r][kk];
+            dst[0] = bf2f4(wp[0]);
+            dst[1] = bf2f4(wp[1]);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kt = 0; kt < MMA_KSTEP / 8; ++kt) {
+            simdgroup_float8x8 a[2];
+            for (uint tm = 0; tm < FC_TM; ++tm) simdgroup_load(a[tm], A + (ulong)tm * 8 * p.lda + k0 + kt * 8, p.lda);
+            for (uint ct = 0; ct < FC_CT; ++ct) {
+                simdgroup_float8x8 b;
+                simdgroup_load(b, &wtile[sg][ct][0][kt * 8], MMA_KSTEP, ulong2(0, 0), true);
+                for (uint tm = 0; tm < FC_TM; ++tm) simdgroup_multiply_accumulate(acc[tm][ct], a[tm], b, acc[tm][ct]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint tm = 0; tm < FC_TM; ++tm) for (uint ct = 0; ct < FC_CT; ++ct) simdgroup_store(acc[tm][ct], &red[sg][tm][ct][0][0], 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        for (uint tm = 0; tm < FC_TM; ++tm) for (uint ct = 0; ct < FC_CT; ++ct) for (uint e = lane; e < 64; e += 32) {
+            const uint rr = e >> 3, cc = e & 7, row = tm * 8 + rr, col = n0 + ct * 8 + cc;
+            if (row < p.M && col < p.N) {
+                float v = 0.0f;
+                for (uint s2 = 0; s2 < FC_SPLIT; ++s2) v += red[s2][tm][ct][rr][cc];
+                v += p.has_bias ? bias[col] : 0.0f;
+                if (p.act == 1) v = silu_f(v);
+                else if (p.act == 2) v = max(v, 0.0f);
+                v *= p.alpha;
+                const ulong ci = (ulong)row * p.ldc + col;
+                C[ci] = p.accumulate ? (C[ci] + v) : v;
+            }
+        }
+    }
+}
+
 /* One threadgroup (LN_THREADS) per row. */
 kernel void layernorm(device const float *X [[buffer(0)]],
                       device const float *gamma [[buffer(1)]],
