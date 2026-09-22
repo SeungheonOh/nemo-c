@@ -121,7 +121,8 @@ kernel void gemm_spec(device const float *A [[buffer(0)]],
    FC_SPLIT SIMD groups each streaming a K slice in steps of FC_KSTEP through the 8x8 matrix
    units (bf16 weight tiles converted to float in threadgroup memory), then a threadgroup
    reduction with the fused epilogue. act == 3 is GLU: the second column tile is taken at
-   n0 + N/2 and the output is a * sigmoid(b) into N/2 columns. A must have 8*FC_TM rows. */
+   n0 + N/2 and the output is a * sigmoid(b) into N/2 columns. A must have its row count
+   rounded up to a multiple of 8*FC_TM (extra rows are read, never stored). */
 constant uint FC_TM [[function_constant(3)]];
 constant uint FC_CT [[function_constant(4)]];
 constant uint FC_SPLIT [[function_constant(5)]];
@@ -133,15 +134,18 @@ kernel void gemm_mma(device const float *A [[buffer(0)]],
                      device const float *bias [[buffer(2)]],
                      device float *C [[buffer(3)]],
                      constant GemmParams &p [[buffer(4)]],
-                     uint g [[threadgroup_position_in_grid]],
+                     uint2 tg [[threadgroup_position_in_grid]],
                      uint lane [[thread_index_in_simdgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float wtile[MMA_WTILE_FLOATS];
     threadgroup float red[8][2][2][8][8];
     const bool glu = p.act == 3;
+    const uint g = tg.x;
+    const uint m0 = tg.y * 8 * FC_TM; /* row block: grid.y > 1 handles M > 8*FC_TM */
     const uint n0 = g * 8 * (glu ? 1 : FC_CT);
     const uint nlim = glu ? p.N / 2 : p.N;
-    if (n0 >= nlim) return;
+    if (n0 >= nlim || m0 >= p.M) return;
+    A += (ulong)m0 * p.lda;
     simdgroup_float8x8 acc[2][2];
     for (uint tm = 0; tm < FC_TM; ++tm) for (uint ct = 0; ct < FC_CT; ++ct) acc[tm][ct] = simdgroup_float8x8(0.0f);
     const uint kper = p.K / FC_SPLIT, kbeg = sg * kper, kend = kbeg + kper;
@@ -174,7 +178,7 @@ kernel void gemm_mma(device const float *A [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
         for (uint tm = 0; tm < FC_TM; ++tm) for (uint e = lane; e < 64; e += 32) {
-            const uint rr = e >> 3, cc = e & 7, row = tm * 8 + rr;
+            const uint rr = e >> 3, cc = e & 7, row = m0 + tm * 8 + rr;
             if (row >= p.M) continue;
             if (glu) {
                 const uint col = n0 + cc;

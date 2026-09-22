@@ -30,7 +30,7 @@ static double now_ms(void) {
 
 typedef struct {
     const char *model_dir, *file, *language, *device, *dump_mel, *dump_enc, *dump_tokens;
-    int latency, realtime, list_devices, list_languages, verbose, no_warmup, block_ms, info;
+    int latency, realtime, list_devices, list_languages, verbose, no_warmup, block_ms, info, gpu_warm;
 } opts_t;
 
 static const int LAT_MS[] = { 80, 160, 320, 560, 1120 };
@@ -47,6 +47,7 @@ static void usage(void) {
         "  --device SPEC        input device index or name substring\n"
         "  --list-devices | --list-languages | --info\n"
         "  --dump-mel F | --dump-enc F | --dump-tokens F   write parity artifacts\n"
+        "  --gpu-warm           keep the GPU clocked up between chunks (halves live chunk latency, costs power)\n"
         "  --no-warmup | --verbose\n");
 }
 
@@ -145,6 +146,21 @@ static void precompile_gemms(model_t *m, char *err, size_t errlen) {
     gpu_buf_free(c);
 }
 
+/* Between chunks the GPU idles and clocks down, so the next chunk starts slow (about 2x the
+   fast-path time). Optional: keep it busy with small dispatches until `until_ms`. Measured on
+   an M4 Max: live 560 ms chunks 14 -> 6 ms; short bursts just before a chunk do not help,
+   the clock governor needs sustained activity. Costs GPU power, hence opt-in. */
+static gpu_buf_t *g_warmbuf = NULL;
+static void gpu_keep_warm(model_t *m, double until_ms) {
+    char err[256];
+    if (!g_warmbuf) g_warmbuf = gpu_buf_alloc(m->gpu, 8u << 20);
+    while (now_ms() < until_ms - 0.3) {
+        gpu_begin(m->gpu);
+        for (int i = 0; i < 4; ++i) k_fill(m, g_warmbuf, 0, 2u << 20, 0.0f);
+        gpu_end(m->gpu, err, sizeof err);
+    }
+}
+
 static void warmup(model_t *m, int right, char *err, size_t errlen) {
     precompile_gemms(m, err, errlen);
     encoder_t *e = encoder_create(m, right);
@@ -180,6 +196,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--info")) { o.info = 1; continue; }
         if (!strcmp(a, "--verbose")) { o.verbose = 1; continue; }
         if (!strcmp(a, "--no-warmup")) { o.no_warmup = 1; continue; }
+        if (!strcmp(a, "--gpu-warm")) { o.gpu_warm = 1; continue; }
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         fprintf(stderr, "unknown option %s\n", a); usage(); return 2;
     }
@@ -254,6 +271,7 @@ int main(int argc, char **argv) {
             int final = pos + n >= ns;
             if (o.realtime) {
                 double target = p.t_start + (double)(pos + n) / MEL_SR * 1000.0;
+                if (o.gpu_warm) { gpu_keep_warm(m, target); }
                 double now = now_ms();
                 if (target > now) usleep((useconds_t)((target - now) * 1000.0));
             }
@@ -274,7 +292,7 @@ int main(int argc, char **argv) {
         p.t_start = now_ms();
         while (!g_stop) {
             size_t n = mic_read(mic, buf, sizeof buf / sizeof *buf);
-            if (!n) { usleep(2000); continue; }
+            if (!n) { if (o.gpu_warm) gpu_keep_warm(m, now_ms() + 2.0); else usleep(2000); continue; }
             total += n;
             if (!signal_seen) {
                 float peak = 0; for (size_t i = 0; i < n; ++i) peak = fmaxf(peak, fabsf(buf[i]));

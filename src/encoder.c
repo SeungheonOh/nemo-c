@@ -50,14 +50,15 @@ encoder_t *encoder_create(model_t *m, int right) {
     const size_t D = (size_t)m->cfg.d_model, CH = (size_t)m->cfg.sub_channels, F = (size_t)m->cfg.feat_in;
     size_t nwin = MEL_CACHE + (size_t)e->chunk_mel + 1;
     size_t T1 = nwin / 2 + 1, F1 = F / 2 + 1, T2 = T1 / 2 + 1, F2 = F1 / 2 + 1, T3 = T2 / 2 + 1, F3 = F2 / 2 + 1;
+    /* +16 rows of slack: gemm_mma reads whole 16-row blocks of its input */
     e->win = gpu_buf_alloc(m->gpu, nwin * F * sizeof(float));
     e->c0 = gpu_buf_alloc(m->gpu, T1 * F1 * CH * sizeof(float));
-    e->c1 = gpu_buf_alloc(m->gpu, T2 * F2 * CH * sizeof(float));
-    e->c2 = gpu_buf_alloc(m->gpu, T2 * F2 * CH * sizeof(float));
-    e->c3 = gpu_buf_alloc(m->gpu, T3 * F3 * CH * sizeof(float));
-    e->c4 = gpu_buf_alloc(m->gpu, T3 * F3 * CH * sizeof(float));
-    e->flat = gpu_buf_alloc(m->gpu, T3 * F3 * CH * sizeof(float));
-    e->pre_out = gpu_buf_alloc(m->gpu, T3 * D * sizeof(float));
+    e->c1 = gpu_buf_alloc(m->gpu, (T2 * F2 + 16) * CH * sizeof(float));
+    e->c2 = gpu_buf_alloc(m->gpu, (T2 * F2 + 16) * CH * sizeof(float));
+    e->c3 = gpu_buf_alloc(m->gpu, (T3 * F3 + 16) * CH * sizeof(float));
+    e->c4 = gpu_buf_alloc(m->gpu, (T3 * F3 + 16) * CH * sizeof(float));
+    e->flat = gpu_buf_alloc(m->gpu, (T3 + 16) * F3 * CH * sizeof(float));
+    e->pre_out = gpu_buf_alloc(m->gpu, (T3 + 16) * D * sizeof(float));
     const size_t cm = (size_t)e->cmax;
     e->h = gpu_buf_alloc(m->gpu, cm * D * sizeof(float));
     e->tmp = gpu_buf_alloc(m->gpu, cm * D * sizeof(float));

@@ -83,13 +83,16 @@ void k_gemm(model_t *m, gpu_buf_t *A, size_t a_off, uint32_t lda, wt_t W, uint32
         uint32_t fc[3] = { M, cols, 2 };
         uint32_t cols_per_tg = act == 3 ? GEMM_SIMDS : GEMM_SIMDS * cols; /* GLU: one output column per SIMD group */
         gpu_dispatch_groups_fc(m->gpu, "gemm_spec", fc, 3, args, 5, (nout + cols_per_tg - 1) / cols_per_tg, 1, 1, GEMM_SIMDS * 32, 1, 1);
-    } else if (M <= GEMM_ROWS) {
+    } else if ((K % 256) == 0) {
         /* 2 column tiles x 8 split-K groups x 32-wide K steps: best or within a few percent of best on
-           every shape at 7 and 14 rows in tools/kbench.c (min of 5 runs, DRAM-resident weights) */
+           every shape at 7 and 14 rows in tools/kbench.c (min of 5 runs, DRAM-resident weights).
+           M > 16 (subsampling 1x1 convs, position table) runs the same kernel over 16-row blocks;
+           the caller guarantees A has its rows padded to a multiple of 16. */
         uint32_t ct = 2, split = 8, kstep = 32;
-        uint32_t fc[7] = { M, 0, 0, M > 8 ? 2u : 1u, ct, split, kstep };
+        uint32_t tm = M > 8 ? 2u : 1u;
+        uint32_t fc[7] = { M, 0, 0, tm, ct, split, kstep };
         uint32_t cols_per_tg = act == 3 ? 8 : 8 * ct;
-        gpu_dispatch_groups_fc(m->gpu, "gemm_mma", fc, 7, args, 5, (nout + cols_per_tg - 1) / cols_per_tg, 1, 1, 32 * split, 1, 1);
+        gpu_dispatch_groups_fc(m->gpu, "gemm_mma", fc, 7, args, 5, (nout + cols_per_tg - 1) / cols_per_tg, (M + 8 * tm - 1) / (8 * tm), 1, 32 * split, 1, 1);
     } else {
         gpu_dispatch_groups(m->gpu, "gemm_bf16", args, 5, (N + GEMM_SIMDS - 1) / GEMM_SIMDS, 1, 1, GEMM_SIMDS * 32, 1, 1);
     }
@@ -283,7 +286,7 @@ model_t *model_load(const char *dir, char *err, size_t errlen) {
     /* relative positional table: pe rows for positions (Lmax-1) .. -(Lmax-1), then per-layer linear_pos */
     {
         int P = 2 * m->Lmax - 1;
-        gpu_buf_t *pe = gpu_buf_alloc(m->gpu, (size_t)P * D * sizeof(float));
+        gpu_buf_t *pe = gpu_buf_alloc(m->gpu, (size_t)(P + 16) * D * sizeof(float)); /* +16 rows: gemm_mma reads whole row blocks */
         float *pef = gpu_buf_ptr(pe);
         for (int r = 0; r < P; ++r) {
             double pos = (double)(m->Lmax - 1 - r);
