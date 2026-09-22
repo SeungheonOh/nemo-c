@@ -1,0 +1,7 @@
+build/
+nemoasr-c
+kbench
+*.d
+out/
+ref/*/
+.DS_Store
