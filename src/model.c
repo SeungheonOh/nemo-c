@@ -1,6 +1,5 @@
 #include "model.h"
 #include "kernel_params.h"
-#define MMA_KSTEP_C 32
 #include <dirent.h>
 #include <math.h>
 #include <stdio.h>
@@ -78,17 +77,28 @@ void k_gemm(model_t *m, gpu_buf_t *A, size_t a_off, uint32_t lda, wt_t W, uint32
          M <= 4          : gemm_spec, 2 columns per SIMD group (pure weight streaming, ~430 GB/s)
          4 < M <= 16     : gemm_mma, split-K over 4 SIMD groups, 8x8 matrix units (1.3-2.5x faster than spec)
          otherwise       : generic gemm_bf16 (subsampling 1x1 convs, position table) */
-    if (M <= 4 || (M <= GEMM_ROWS && (K % (MMA_KSTEP_C * 4)) != 0)) {
+    const uint32_t nout = act == 3 ? N / 2 : N; /* GLU halves the output width */
+    if (M <= 4 || (M <= GEMM_ROWS && (K % 256) != 0)) {
         uint32_t cols = 2;
         uint32_t fc[3] = { M, cols, 2 };
-        gpu_dispatch_groups_fc(m->gpu, "gemm_spec", fc, 3, args, 5, (N + GEMM_SIMDS * cols - 1) / (GEMM_SIMDS * cols), 1, 1, GEMM_SIMDS * 32, 1, 1);
+        uint32_t cols_per_tg = act == 3 ? GEMM_SIMDS : GEMM_SIMDS * cols; /* GLU: one output column per SIMD group */
+        gpu_dispatch_groups_fc(m->gpu, "gemm_spec", fc, 3, args, 5, (nout + cols_per_tg - 1) / cols_per_tg, 1, 1, GEMM_SIMDS * 32, 1, 1);
     } else if (M <= GEMM_ROWS) {
-        uint32_t ct = (M > 8 && K <= 1024) ? 1 : 2, split = 4;
-        uint32_t fc[6] = { M, 0, 0, M > 8 ? 2u : 1u, ct, split };
-        gpu_dispatch_groups_fc(m->gpu, "gemm_mma", fc, 6, args, 5, (N + 8 * ct - 1) / (8 * ct), 1, 1, 32 * split, 1, 1);
+        /* 2 column tiles x 8 split-K groups x 32-wide K steps: best or within a few percent of best on
+           every shape at 7 and 14 rows in tools/kbench.c (min of 5 runs, DRAM-resident weights) */
+        uint32_t ct = 2, split = 8, kstep = 32;
+        uint32_t fc[7] = { M, 0, 0, M > 8 ? 2u : 1u, ct, split, kstep };
+        uint32_t cols_per_tg = act == 3 ? 8 : 8 * ct;
+        gpu_dispatch_groups_fc(m->gpu, "gemm_mma", fc, 7, args, 5, (nout + cols_per_tg - 1) / cols_per_tg, 1, 1, 32 * split, 1, 1);
     } else {
         gpu_dispatch_groups(m->gpu, "gemm_bf16", args, 5, (N + GEMM_SIMDS - 1) / GEMM_SIMDS, 1, 1, GEMM_SIMDS * 32, 1, 1);
     }
+}
+void k_layernorm2(model_t *m, gpu_buf_t *X, gpu_buf_t *g1, gpu_buf_t *b1, gpu_buf_t *g2, gpu_buf_t *b2, gpu_buf_t *Y1, gpu_buf_t *Y2, uint32_t M, uint32_t D) {
+    if (nemo_skip_mask & 4) return;
+    LnParams p = { M, D, m->cfg.ln_eps };
+    gpu_arg_t args[8] = { GPU_BUF(X, 0), GPU_BUF(g1, 0), GPU_BUF(b1, 0), GPU_BUF(g2, 0), GPU_BUF(b2, 0), GPU_BUF(Y1, 0), GPU_BUF(Y2, 0), GPU_BYTES(&p) };
+    gpu_dispatch_groups(m->gpu, "layernorm2", args, 8, M, 1, 1, LN_THREADS, 1, 1);
 }
 void k_layernorm(model_t *m, gpu_buf_t *X, size_t x_off, gpu_buf_t *g, gpu_buf_t *b, gpu_buf_t *Y, size_t y_off, uint32_t M, uint32_t D) {
     if (nemo_skip_mask & 4) return;

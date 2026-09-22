@@ -52,76 +52,36 @@ static const char *extra_src =
 "        for (uint r = 0; r < GEMM_ROWS; ++r) { if (r >= rows) break; float v = simd_sum(acc[r] + acc2[r]);\n"
 "            if (lane == 0) { v += p.has_bias ? bias[n] : 0.0f; if (p.act == 1) v = silu_f(v); else if (p.act == 2) v = max(v, 0.0f); v *= p.alpha;\n"
 "                const ulong ci = (ulong)(m0 + r) * p.ldc + n; C[ci] = p.accumulate ? (C[ci] + v) : v; } } } }\n"
-"constant uint FC_TM [[function_constant(3)]];\n"
-"constant uint FC_CT [[function_constant(4)]];\n"
-"#define MMA_SIMDS 2\n#define MMA_KSTEP 32\n#define MMA_MAXCT 4\n"
-"kernel void gemm_mma(device const float *A [[buffer(0)]], device const ushort *W [[buffer(1)]], device const float *bias [[buffer(2)]],\n"
-"                     device float *C [[buffer(3)]], constant GemmParams &p [[buffer(4)]], uint g [[threadgroup_position_in_grid]],\n"
-"                     uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
-"    threadgroup float wtile[MMA_SIMDS][MMA_MAXCT][8][MMA_KSTEP];\n"
-"    threadgroup float ctile[MMA_SIMDS][8][8];\n"
-"    const uint n0 = (g * MMA_SIMDS + sg) * 8 * FC_CT;\n"
-"    if (n0 >= p.N) return;\n"
-"    simdgroup_float8x8 acc[2][MMA_MAXCT];\n"
-"    for (uint tm = 0; tm < FC_TM; ++tm) for (uint ct = 0; ct < FC_CT; ++ct) acc[tm][ct] = simdgroup_float8x8(0.0f);\n"
-"    const uint r = lane >> 2, kk = (lane & 3) * 8;\n"
-"    for (uint k0 = 0; k0 < p.K; k0 += MMA_KSTEP) {\n"
-"        for (uint ct = 0; ct < FC_CT; ++ct) {\n"
-"            device const ushort4 *wp = (device const ushort4 *)(W + (ulong)min(n0 + ct * 8 + r, p.N - 1) * p.ldw + k0 + kk);\n"
-"            threadgroup float4 *dst = (threadgroup float4 *)&wtile[sg][ct][r][kk];\n"
-"            dst[0] = bf2f4(wp[0]); dst[1] = bf2f4(wp[1]);\n"
-"        }\n"
-"        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-"        for (uint kt = 0; kt < MMA_KSTEP / 8; ++kt) {\n"
-"            simdgroup_float8x8 a[2];\n"
-"            for (uint tm = 0; tm < FC_TM; ++tm) simdgroup_load(a[tm], A + (ulong)tm * 8 * p.lda + k0 + kt * 8, p.lda);\n"
-"            for (uint ct = 0; ct < FC_CT; ++ct) {\n"
-"                simdgroup_float8x8 b;\n"
-"                simdgroup_load(b, &wtile[sg][ct][0][kt * 8], MMA_KSTEP, ulong2(0, 0), true);\n"
-"                for (uint tm = 0; tm < FC_TM; ++tm) simdgroup_multiply_accumulate(acc[tm][ct], a[tm], b, acc[tm][ct]);\n"
-"            }\n"
-"        }\n"
-"        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    }\n"
-"    for (uint tm = 0; tm < FC_TM; ++tm) for (uint ct = 0; ct < FC_CT; ++ct) {\n"
-"        simdgroup_store(acc[tm][ct], &ctile[sg][0][0], 8);\n"
-"        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-"        for (uint e = lane; e < 64; e += 32) {\n"
-"            const uint rr = e >> 3, cc = e & 7, row = tm * 8 + rr, col = n0 + ct * 8 + cc;\n"
-"            if (row < p.M && col < p.N) {\n"
-"                float v = ctile[sg][rr][cc] + (p.has_bias ? bias[col] : 0.0f);\n"
-"                if (p.act == 1) v = silu_f(v); else if (p.act == 2) v = max(v, 0.0f);\n"
-"                v *= p.alpha; const ulong ci = (ulong)row * p.ldc + col; C[ci] = p.accumulate ? (C[ci] + v) : v;\n"
-"            }\n"
-"        }\n"
-"        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    }\n"
-"}\n"
-"constant uint FC_SPLIT [[function_constant(5)]];\n"
-"kernel void gemm_mma2(device const float *A [[buffer(0)]], device const ushort *W [[buffer(1)]], device const float *bias [[buffer(2)]],\n"
+"constant uint FC_KSTEP [[function_constant(6)]];\n"
+"kernel void gemm_mma3(device const float *A [[buffer(0)]], device const ushort *W [[buffer(1)]], device const float *bias [[buffer(2)]],\n"
 "                      device float *C [[buffer(3)]], constant GemmParams &p [[buffer(4)]], uint g [[threadgroup_position_in_grid]],\n"
 "                      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
-"    threadgroup float wtile[4][MMA_MAXCT][8][MMA_KSTEP];\n"
-"    threadgroup float red[4][2][MMA_MAXCT][8][8];\n"
+"    threadgroup float wtile[8 * 2 * 8 * 64 / 2];  /* up to 16 KB: SPLIT*CT*8*KSTEP floats */\n"
+"    threadgroup float red[8][2][2][8][8];\n"
 "    const uint n0 = g * 8 * FC_CT;\n"
 "    if (n0 >= p.N) return;\n"
-"    simdgroup_float8x8 acc[2][MMA_MAXCT];\n"
+"    simdgroup_float8x8 acc[2][2];\n"
 "    for (uint tm = 0; tm < FC_TM; ++tm) for (uint ct = 0; ct < FC_CT; ++ct) acc[tm][ct] = simdgroup_float8x8(0.0f);\n"
-"    const uint r = lane >> 2, kk = (lane & 3) * 8;\n"
 "    const uint kper = p.K / FC_SPLIT, kbeg = sg * kper, kend = kbeg + kper;\n"
-"    for (uint k0 = kbeg; k0 < kend; k0 += MMA_KSTEP) {\n"
+"    threadgroup float *wt = wtile + sg * FC_CT * 8 * FC_KSTEP;   /* this SIMD group's [CT][8][KSTEP] */\n"
+"    const uint per_row = FC_KSTEP / 8;                            /* ushort4x2 chunks of 8 per row */\n"
+"    for (uint k0 = kbeg; k0 < kend; k0 += FC_KSTEP) {\n"
 "        for (uint ct = 0; ct < FC_CT; ++ct) {\n"
-"            device const ushort4 *wp = (device const ushort4 *)(W + (ulong)min(n0 + ct * 8 + r, p.N - 1) * p.ldw + k0 + kk);\n"
-"            threadgroup float4 *dst = (threadgroup float4 *)&wtile[sg][ct][r][kk];\n"
-"            dst[0] = bf2f4(wp[0]); dst[1] = bf2f4(wp[1]);\n"
+"            /* 32 lanes cover 8 rows x KSTEP: lane -> (row, 8-wide chunk); KSTEP=64 needs 2 passes */\n"
+"            for (uint e = lane; e < 8 * per_row; e += 32) {\n"
+"                const uint r = e / per_row, kk = (e % per_row) * 8;\n"
+"                device const ushort4 *wp = (device const ushort4 *)(W + (ulong)min(n0 + ct * 8 + r, p.N - 1) * p.ldw + k0 + kk);\n"
+"                threadgroup float4 *dst = (threadgroup float4 *)(wt + (ct * 8 + r) * FC_KSTEP + kk);\n"
+"                dst[0] = bf2f4(wp[0]); dst[1] = bf2f4(wp[1]);\n"
+"            }\n"
 "        }\n"
 "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
-"        for (uint kt = 0; kt < MMA_KSTEP / 8; ++kt) {\n"
+"        for (uint kt = 0; kt < FC_KSTEP / 8; ++kt) {\n"
 "            simdgroup_float8x8 a[2];\n"
 "            for (uint tm = 0; tm < FC_TM; ++tm) simdgroup_load(a[tm], A + (ulong)tm * 8 * p.lda + k0 + kt * 8, p.lda);\n"
 "            for (uint ct = 0; ct < FC_CT; ++ct) {\n"
 "                simdgroup_float8x8 b;\n"
-"                simdgroup_load(b, &wtile[sg][ct][0][kt * 8], MMA_KSTEP, ulong2(0, 0), true);\n"
+"                simdgroup_load(b, wt + ct * 8 * FC_KSTEP + kt * 8, FC_KSTEP, ulong2(0, 0), true);\n"
 "                for (uint tm = 0; tm < FC_TM; ++tm) simdgroup_multiply_accumulate(acc[tm][ct], a[tm], b, acc[tm][ct]);\n"
 "            }\n"
 "        }\n"
@@ -204,56 +164,45 @@ int main(void) {
     gpu_buf_t *Ws[NW];
     for (int i = 0; i < NW; ++i) { Ws[i] = gpu_buf_alloc(G, 4096 * 1024 * 2); memcpy(gpu_buf_ptr(Ws[i]), wf, 4096 * 1024 * 2); }
     gpu_buf_t *Abig = gpu_buf_alloc(G, 16 * 4096 * sizeof(float)); memcpy(gpu_buf_ptr(Abig), af, 16 * 4096 * sizeof(float));
-    printf("\n--- DRAM-realistic (24 distinct weight matrices per timing), ms per gemm ---\n");
-    printf("%-9s %3s | %-8s | %-8s %-8s %-8s | %-8s %-8s %-8s\n", "shape", "M", "spec c2", "ct1 s1", "ct1 s2", "ct1 s4", "ct2 s2", "ct2 s4", "ct4 s4");
-    const uint32_t cfg[6][2] = { {1,1}, {1,2}, {1,4}, {2,2}, {2,4}, {4,4} };
+    printf("\n--- DRAM-realistic, min of 5 runs, ms per gemm: mma3 variants (ct,split,kstep) ---\n");
+    printf("%-9s %3s | %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n", "shape", "M", "2,4,32", "2,4,64", "1,8,32", "1,8,64", "1,4,64", "1,4,32", "2,8,32");
+    const uint32_t cfg[7][3] = { {2,4,32}, {2,4,64}, {1,8,32}, {1,8,64}, {1,4,64}, {1,4,32}, {2,8,32} };
+    const uint32_t Ms2[] = { 7, 14 };
     for (size_t sh = 0; sh < sizeof shapes / sizeof *shapes; ++sh) {
         const uint32_t N = shapes[sh].N, K = shapes[sh].K;
-        for (size_t mi = 0; mi < 3; ++mi) {
-            const uint32_t M = Ms[mi];
+        for (size_t mi = 0; mi < 2; ++mi) {
+            const uint32_t M = Ms2[mi];
             GemmParams p = { M, N, K, K, K, N, 0, 0, 0, 1.0f };
-            double t[7] = {0};
+            double t[7];
             for (int variant = 0; variant < 7; ++variant) {
-                for (int rep = 0; rep < 2; ++rep) {
+                uint32_t ct = cfg[variant][0], sp = cfg[variant][1], ks = cfg[variant][2];
+                if (K % (sp * ks) || sp * ct * ks > 512) { t[variant] = -1; continue; }
+                double best = 1e9;
+                for (int rep = 0; rep < 5; ++rep) {
                     gpu_begin(G);
                     for (int i = 0; i < NW; ++i) {
                         gpu_arg_t args[5] = { GPU_BUF(Abig, 0), GPU_BUF(Ws[i], 0), GPU_BUF(Abig, 0), GPU_BUF(C, 0), GPU_BYTES(&p) };
-                        if (variant == 0) { uint32_t fc[3] = { M, 2, 2 }; gpu_dispatch_groups_fc(G, "gemm_spec", fc, 3, args, 5, (N + GEMM_SIMDS * 2 - 1) / (GEMM_SIMDS * 2), 1, 1, 256, 1, 1); }
-                        else { uint32_t ct = cfg[variant - 1][0], sp = cfg[variant - 1][1]; uint32_t fc[6] = { M, 1, 1, M > 8 ? 2u : 1u, ct, sp };
-                               gpu_dispatch_groups_fc(G, "gemm_mma2", fc, 6, args, 5, (N + 8 * ct - 1) / (8 * ct), 1, 1, 32 * sp, 1, 1); }
+                        uint32_t fc[7] = { M, 0, 0, M > 8 ? 2u : 1u, ct, sp, ks };
+                        gpu_dispatch_groups_fc(G, "gemm_mma3", fc, 7, args, 5, (N + 8 * ct - 1) / (8 * ct), 1, 1, 32 * sp, 1, 1);
                     }
                     if (gpu_end(G, err, sizeof err)) die(err);
+                    best = fmin(best, gpu_last_ms(G) / NW);
                 }
-                t[variant] = gpu_last_ms(G) / NW;
+                t[variant] = best;
             }
-            double best = t[0]; for (int v = 1; v < 7; ++v) best = fmin(best, t[v]);
-            printf("%-9s %3u | %8.4f | %8.4f %8.4f %8.4f | %8.4f %8.4f %8.4f   (best %.0f GB/s)\n", shapes[sh].what, M, t[0], t[1], t[2], t[3], t[4], t[5], t[6], N * K * 2 / (best / 1000.0) / 1e9);
+            printf("%-9s %3u | %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f %8.4f\n", shapes[sh].what, M, t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
         }
     }
-    /* mma2 correctness vs gemm_bf16 */
-    for (uint32_t M = 1; M <= 14; M += 13) {
-        GemmParams p = { M, 1024, 4096, 4096, 4096, 1024, 0, 0, 0, 1.0f };
+    { /* mma3 correctness */
+        GemmParams p = { 14, 1024, 4096, 4096, 4096, 1024, 0, 0, 0, 1.0f };
         gpu_arg_t args[5] = { GPU_BUF(Abig, 0), GPU_BUF(Ws[0], 0), GPU_BUF(Abig, 0), GPU_BUF(C, 0), GPU_BYTES(&p) };
         gpu_begin(G); gpu_dispatch_groups(G, "gemm_bf16", args, 5, 1024 / 8, 1, 1, 256, 1, 1); gpu_end(G, err, sizeof err);
-        float *ref = malloc(M * 1024 * sizeof(float)); memcpy(ref, gpu_buf_ptr(C), M * 1024 * sizeof(float));
-        uint32_t fc[6] = { M, 1, 1, M > 8 ? 2u : 1u, 2, 4 };
-        gpu_begin(G); gpu_dispatch_groups_fc(G, "gemm_mma2", fc, 6, args, 5, 1024 / 16, 1, 1, 128, 1, 1); gpu_end(G, err, sizeof err);
-        float *got = gpu_buf_ptr(C); double md = 0, mref = 0;
-        for (size_t i = 0; i < M * 1024; ++i) { md = fmax(md, fabs(got[i] - ref[i])); mref = fmax(mref, fabs(ref[i])); }
-        printf("gemm_mma2 (ct2,s4) M=%u max diff vs gemm_bf16: %.3e (ref max %.3e)\n", M, md, mref);
-        free(ref);
-    }
-    /* mma correctness vs gemm_bf16 */
-    for (uint32_t M = 1; M <= 14; M += 13) {
-        GemmParams p = { M, 1024, 4096, 4096, 4096, 1024, 0, 0, 0, 1.0f };
-        gpu_arg_t args[5] = { GPU_BUF(Abig, 0), GPU_BUF(Ws[0], 0), GPU_BUF(Abig, 0), GPU_BUF(C, 0), GPU_BYTES(&p) };
-        gpu_begin(G); gpu_dispatch_groups(G, "gemm_bf16", args, 5, 1024 / 8, 1, 1, 256, 1, 1); gpu_end(G, err, sizeof err);
-        float *ref = malloc(M * 1024 * sizeof(float)); memcpy(ref, gpu_buf_ptr(C), M * 1024 * sizeof(float));
-        uint32_t fc[5] = { M, 1, 1, M > 8 ? 2u : 1u, 2 };
-        gpu_begin(G); gpu_dispatch_groups_fc(G, "gemm_mma", fc, 5, args, 5, 1024 / 32, 1, 1, 64, 1, 1); gpu_end(G, err, sizeof err);
-        float *got = gpu_buf_ptr(C); double md = 0, mref = 0;
-        for (size_t i = 0; i < M * 1024; ++i) { md = fmax(md, fabs(got[i] - ref[i])); mref = fmax(mref, fabs(ref[i])); }
-        printf("gemm_mma M=%u max diff vs gemm_bf16: %.3e (ref max %.3e)\n", M, md, mref);
+        float *ref = malloc(14 * 1024 * sizeof(float)); memcpy(ref, gpu_buf_ptr(C), 14 * 1024 * sizeof(float));
+        uint32_t fc[7] = { 14, 0, 0, 2, 1, 8, 64 };
+        gpu_begin(G); gpu_dispatch_groups_fc(G, "gemm_mma3", fc, 7, args, 5, 1024 / 8, 1, 1, 256, 1, 1); gpu_end(G, err, sizeof err);
+        float *got = gpu_buf_ptr(C); double md = 0;
+        for (size_t i = 0; i < 14 * 1024; ++i) md = fmax(md, fabs(got[i] - ref[i]));
+        printf("gemm_mma3 (1,8,64) M=14 max diff vs gemm_bf16: %.3e\n", md);
         free(ref);
     }
     /* correctness of gemm_spec vs gemm_bf16 for M=14, cols=4 */

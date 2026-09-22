@@ -71,6 +71,7 @@ int model_right_context_trained(const model_t *m, int right);
 void k_gemm(model_t *m, gpu_buf_t *A, size_t a_off, uint32_t lda, wt_t W, uint32_t ldw, gpu_buf_t *bias,
             gpu_buf_t *C, size_t c_off, uint32_t ldc, uint32_t M, uint32_t N, uint32_t K, int act, int accumulate, float alpha);
 void k_layernorm(model_t *m, gpu_buf_t *X, size_t x_off, gpu_buf_t *g, gpu_buf_t *b, gpu_buf_t *Y, size_t y_off, uint32_t M, uint32_t D);
+void k_layernorm2(model_t *m, gpu_buf_t *X, gpu_buf_t *g1, gpu_buf_t *b1, gpu_buf_t *g2, gpu_buf_t *b2, gpu_buf_t *Y1, gpu_buf_t *Y2, uint32_t M, uint32_t D);
 void k_copy(model_t *m, gpu_buf_t *src, size_t s_off, gpu_buf_t *dst, size_t d_off, uint32_t n);
 void k_fill(model_t *m, gpu_buf_t *dst, size_t d_off, uint32_t n, float v);
 

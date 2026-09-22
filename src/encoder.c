@@ -28,7 +28,7 @@ struct encoder {
     /* subsampling buffers */
     gpu_buf_t *win, *c0, *c1, *c2, *c3, *c4, *flat, *pre_out;
     /* block buffers */
-    gpu_buf_t *h, *tmp, *ff, *att, *g2, *y, *ph, *prompted, *joint_enc;
+    gpu_buf_t *h, *tmp, *t2, *ff, *att, *y, *ph, *prompted, *joint_enc;
     /* per layer: kv[l] rows of 3*D floats (q | k | v), din[l] rows of D floats (GLU output);
        both append-only, compacted once per epoch so no per-chunk copies are needed */
     gpu_buf_t **kv, **din;
@@ -63,7 +63,7 @@ encoder_t *encoder_create(model_t *m, int right) {
     e->tmp = gpu_buf_alloc(m->gpu, cm * D * sizeof(float));
     e->ff = gpu_buf_alloc(m->gpu, cm * (size_t)m->cfg.d_ff * sizeof(float));
     e->att = gpu_buf_alloc(m->gpu, cm * D * sizeof(float));
-    e->g2 = gpu_buf_alloc(m->gpu, cm * 2 * D * sizeof(float));
+    e->t2 = gpu_buf_alloc(m->gpu, cm * D * sizeof(float));
     e->y = gpu_buf_alloc(m->gpu, cm * D * sizeof(float));
     e->ph = gpu_buf_alloc(m->gpu, cm * (size_t)m->cfg.prompt_hidden * sizeof(float));
     e->prompted = gpu_buf_alloc(m->gpu, cm * D * sizeof(float));
@@ -81,7 +81,7 @@ encoder_t *encoder_create(model_t *m, int right) {
 }
 void encoder_destroy(encoder_t *e) {
     if (!e) return;
-    gpu_buf_t *bufs[] = { e->win, e->c0, e->c1, e->c2, e->c3, e->c4, e->flat, e->pre_out, e->h, e->tmp, e->ff, e->att, e->g2, e->y, e->ph, e->prompted, e->joint_enc };
+    gpu_buf_t *bufs[] = { e->win, e->c0, e->c1, e->c2, e->c3, e->c4, e->flat, e->pre_out, e->h, e->tmp, e->t2, e->ff, e->att, e->y, e->ph, e->prompted, e->joint_enc };
     for (size_t i = 0; i < sizeof bufs / sizeof *bufs; ++i) gpu_buf_free(bufs[i]);
     for (int l = 0; l < e->m->cfg.n_layers; ++l) { gpu_buf_free(e->kv[l]); gpu_buf_free(e->din[l]); }
     free(e->kv); free(e->din);
@@ -134,12 +134,12 @@ static void run_blocks(encoder_t *e, int c) {
     const size_t rowb = (size_t)D * sizeof(float), kvrowb = 3 * rowb;
     const uint32_t L = (uint32_t)(e->cache_len + c);
     const int pos = e->pos;
-    gpu_buf_t *h = e->h, *t = e->tmp;
+    gpu_buf_t *h = e->h, *t = e->tmp, *t2 = e->t2;
     for (int l = 0; l < m->cfg.n_layers; ++l) {
         layer_w_t *W = &m->layers[l];
-        /* FF1 (half-step) */
-        k_layernorm(m, h, 0, W->ln_ff1_g, W->ln_ff1_b, t, 0, (uint32_t)c, D);
-        k_gemm(m, t, 0, D, W->ff1_w1, D, NULL, e->ff, 0, FF, (uint32_t)c, FF, D, 1, 0, 1.0f);
+        /* FF1 (half-step); for l > 0 the norm was fused into the previous block's output norm (t2) */
+        if (l == 0) k_layernorm(m, h, 0, W->ln_ff1_g, W->ln_ff1_b, t2, 0, (uint32_t)c, D);
+        k_gemm(m, t2, 0, D, W->ff1_w1, D, NULL, e->ff, 0, FF, (uint32_t)c, FF, D, 1, 0, 1.0f);
         k_gemm(m, e->ff, 0, FF, W->ff1_w2, FF, NULL, h, 0, D, (uint32_t)c, D, FF, 0, 1, 0.5f);
         /* attention: fused q|k|v projection appended to the per-layer cache rows [pos, pos+c) */
         k_layernorm(m, h, 0, W->ln_att_g, W->ln_att_b, t, 0, (uint32_t)c, D);
@@ -153,10 +153,8 @@ static void run_blocks(encoder_t *e, int c) {
         /* convolution module: GLU output appended at din rows [pos, pos+c); the causal conv reads
            the previous conv_left rows as history */
         k_layernorm(m, h, 0, W->ln_conv_g, W->ln_conv_b, t, 0, (uint32_t)c, D);
-        k_gemm(m, t, 0, D, W->pw1, D, NULL, e->g2, 0, 2 * D, (uint32_t)c, 2 * D, D, 0, 0, 1.0f);
-        GluParams gp = { (uint32_t)c, D };
-        gpu_arg_t ag[3] = { GPU_BUF(e->g2, 0), GPU_BUF(e->din[l], (size_t)pos * rowb), GPU_BYTES(&gp) };
-        if (!(nemo_skip_mask & 16)) gpu_dispatch(m->gpu, "glu", ag, 3, D, (uint32_t)c, 1, 256, 1, 1);
+        /* pointwise conv 1 with the GLU fused into the GEMM epilogue, written straight into the conv history */
+        k_gemm(m, t, 0, D, W->pw1, D, NULL, e->din[l], (size_t)pos * rowb, D, (uint32_t)c, 2 * D, D, 3, 0, 1.0f);
         DwParams dp = { (uint32_t)c, D, (uint32_t)m->cfg.conv_kernel, m->cfg.ln_eps };
         gpu_arg_t ad[6] = { GPU_BUF(e->din[l], (size_t)(pos - e->conv_left) * rowb), GPU_BUF(W->dw_w, 0), GPU_BUF(W->bn_g, 0), GPU_BUF(W->bn_b, 0), GPU_BUF(e->y, 0), GPU_BYTES(&dp) };
         if (!(nemo_skip_mask & 16)) gpu_dispatch_groups(m->gpu, "dwconv_ln_silu", ad, 6, (uint32_t)c, 1, 1, LN_THREADS, 1, 1);
@@ -165,7 +163,13 @@ static void run_blocks(encoder_t *e, int c) {
         k_layernorm(m, h, 0, W->ln_ff2_g, W->ln_ff2_b, t, 0, (uint32_t)c, D);
         k_gemm(m, t, 0, D, W->ff2_w1, D, NULL, e->ff, 0, FF, (uint32_t)c, FF, D, 1, 0, 1.0f);
         k_gemm(m, e->ff, 0, FF, W->ff2_w2, FF, NULL, h, 0, D, (uint32_t)c, D, FF, 0, 1, 0.5f);
-        k_layernorm(m, h, 0, W->ln_out_g, W->ln_out_b, t, 0, (uint32_t)c, D);
+        if (l + 1 < m->cfg.n_layers) {
+            /* output norm of this block and the FF1 norm of the next in one dispatch */
+            layer_w_t *Wn = &m->layers[l + 1];
+            k_layernorm2(m, h, W->ln_out_g, W->ln_out_b, Wn->ln_ff1_g, Wn->ln_ff1_b, t, t2, (uint32_t)c, D);
+        } else {
+            k_layernorm(m, h, 0, W->ln_out_g, W->ln_out_b, t, 0, (uint32_t)c, D);
+        }
         gpu_buf_t *sw = h; h = t; t = sw;
     }
     /* language prompt (one-hot folded into the bias) and joint encoder projection */
