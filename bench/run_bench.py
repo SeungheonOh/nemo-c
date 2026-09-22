@@ -114,6 +114,7 @@ def write_md(res):
             r = pick(res["realtime"], impl, clip, lat)
             if not r: continue
             L.append(f"| {clip} | {lat} ms | {impl} | {r.get('cpu_avg', 0):.1f}% | {r.get('cpu_peak', 0):.1f}% | {r.get('rss_avg_mb', r.get('max_rss_mb', 0)):.0f} MB | {r['rtf']:.3f} | {r['enc_mean_ms']:.1f} ms | {r['dec_per_step_ms']:.2f} ms |")
+    L.append("\nThe live-rate penalty is GPU clock ramp: the GPU idles between chunks and starts each one at low clocks. `nemoasr-c --gpu-warm` keeps it busy while waiting for audio and brings live chunks back to the fast-path time (measured 14.2 -> 6.3 ms at 560 ms, 10.7 -> 5.5 ms at 80 ms) at a power cost, so it is off by default. Short warm-up bursts just before a chunk were measured and do not help; the governor needs sustained activity.\n")
     L.append("\n## Start-up\n")
     L.append("| impl | interpreter / imports | model load | warm-up (kernel compile) | total to first audio |")
     L.append("|---|---|---|---|---|")
@@ -122,7 +123,19 @@ def write_md(res):
     if m: L.append(f"| mlx | {m['import_ms']:.0f} ms | {m['load_ms']:.0f} ms | {m['warmup_ms']:.0f} ms | {m['import_ms'] + m['load_ms'] + m['warmup_ms']:.0f} ms |")
     L.append("\n## Output parity\n")
     L.append("`tools/compare.py` checks the C dumps against MLX dumps (`tools/mlx_reference.py`): log-mel frames, every post-prompt encoder frame, and the emitted token ids. "
-             "On fox, mixed, pauses and narrate at 560 ms, fox at 80 ms and narrate at 1120 ms, in en-US and auto, the token sequences are identical and encoder outputs agree to about 3e-5 absolute (bf16 weights, f32 activations in both).\n")
+             "On fox, mixed, pauses and narrate at 560 ms, fox at 80 ms and narrate at 80 and 1120 ms, in en-US and auto, the token sequences are identical and encoder outputs agree to about 3e-5 absolute (bf16 weights, f32 activations in both). The parity checks were re-run after every kernel change.\n")
+    L.append("## Optimisation history (encoder chunk, fast path, M4 Max)\n")
+    L.append("| step | 80 ms | 560 ms | 1120 ms |")
+    L.append("|---|---|---|---|")
+    L.append("| first working version (one thread per output column) | 32 ms | 34 ms | 36 ms |")
+    L.append("| SIMD-group cooperative GEMM, attention, joint | 7.1 | 12.3 | 20.3 |")
+    L.append("| specialised + split-K MMA GEMM | 5.4 | 7.4 | 8.6 |")
+    L.append("| append-only caches, fused QKV, batched joint | 5.2 | 7.0 | 8.2 |")
+    L.append("| unified MMA policy, GLU + paired LN fusion | 5.6 | 6.4 | 7.8 |")
+    L.append("| MMA for many-row GEMMs (subsampling) | 4.9 | 5.8 | 6.9 |")
+    L.append("| attention: cooperative lanes, parallel softmax | 4.7 | 5.7 | 6.5 |")
+    L.append("")
+    L.append("Remaining time at 560 ms: about 3.9 ms of GEMM against a DRAM floor near 2.9 ms (1.1 GB of bf16 weights per chunk), and about 1.7 ms of everything else, most of it the fixed cost of ~340 dispatches at ~3 us each.\n")
     open(os.path.join(ROOT, "COMPARISON.md"), "w").write("\n".join(L) + "\n")
     print("wrote COMPARISON.md")
 

@@ -13,6 +13,7 @@ make
 ./nemoasr-c --latency 80            # lowest delay (80 | 320 | 560 | 1120)
 ./nemoasr-c --file ref/fox.wav      # any sample rate; resampled internally
 ./nemoasr-c --file ref/narrate.wav --realtime --verbose
+./nemoasr-c --gpu-warm                # lowest live latency, more power
 ./nemoasr-c --list-devices
 ./nemoasr-c --list-languages
 ```
@@ -38,13 +39,29 @@ flowchart LR
 | JSON | `src/json.c` | small DOM parser for `config.json` and the safetensors header |
 | Log-mel frontend | `src/mel.c` | CPU, double-precision radix-2 FFT, exact centered/reflect framing of NeMo |
 | Resampler | `src/resample.c` | Blackman-windowed sinc, any ratio, streaming |
-| Metal kernels | `src/kernels.metal` | bf16 GEMM (SIMD-group per output column), LayerNorm, relative-position attention, GLU, depthwise conv + LN + SiLU, 3×3 stride-2 convs, LSTM cell, two-stage joint argmax |
+| Metal kernels | `src/kernels.metal` | three bf16 GEMMs chosen per shape (see below), LayerNorm and a paired two-LayerNorm kernel, relative-position attention, depthwise conv + LN + SiLU, 3×3 stride-2 convs, LSTM cell, batched two-stage joint argmax |
 | Metal glue | `src/gpu.m` | Objective-C: device, runtime kernel compilation (no fast-math), batched dispatch, shared buffers |
-| Encoder | `src/encoder.c` | Mirrors `ConformerStreamingState`: mel cache of 16 frames, per-layer attention (56 frames) and conv (8 frames) caches, exact chunk bookkeeping incl. the final boundary window |
-| Decoder | `src/decoder.c` | Greedy RNNT with `max_symbols`, provisional/committed LSTM state, one command buffer per joint step |
+| Encoder | `src/encoder.c` | Mirrors `ConformerStreamingState`: mel cache of 16 frames, per-layer attention (56 frames) and conv (8 frames) histories in append-only buffers compacted once per epoch, fused q/k/v projection, exact chunk bookkeeping incl. the final boundary window |
+| Decoder | `src/decoder.c` | Greedy RNNT with `max_symbols`, provisional/committed LSTM state; the joint is evaluated for all remaining frames of a chunk in one round trip (speculating blank), so round trips are about one per emitted token |
 | Mic | `src/mic.c` | AudioQueue input at the device's nominal rate, device listing/selection, ring buffer |
 
-Activations are float32; weights stay bf16 in GPU memory and are converted in-register inside the kernels. One encoder chunk is a single Metal command buffer with about 500 dispatches. The decoder issues one small command buffer per joint evaluation because the argmax decides the next step.
+Activations are float32; weights stay bf16 in GPU memory and are converted in-register inside the kernels. One encoder chunk is a single Metal command buffer with about 340 dispatches.
+
+### GEMM kernels
+
+All three read bf16 weights row-major `[N][K]` and are picked in `k_gemm` by shape, from measurements in `tools/kbench.c` against 24 distinct weight matrices (so DRAM, not cache, is what gets measured):
+
+| kernel | used for | how |
+|---|---|---|
+| `gemm_spec` | M ≤ 4 rows | one SIMD group per pair of output columns, lanes stream the weight rows cooperatively; row count, columns and unroll are Metal function constants so the loops are fully unrolled. About 430 GB/s. |
+| `gemm_mma` | 4 < M, and any M with K a multiple of 256 | split-K over 8 SIMD groups feeding the 8×8 `simdgroup_matrix` units, bf16 tiles converted to float in threadgroup memory, threadgroup reduction with the fused epilogue (bias, SiLU/ReLU, GLU pairing column n with n+N/2, scaled residual accumulate). 16-row blocks over a 2D grid for many-row inputs. |
+| `gemm_bf16` | fallback | generic SIMD-group-per-column kernel |
+
+Pipelines for every row count 1..16 are compiled during warm-up so no chunk pays a pipeline build mid-stream.
+
+### Live mode and `--gpu-warm`
+
+Between chunks the GPU idles and clocks down, so at real time a chunk takes about twice its fast-path time (14 vs 6 ms at 560 ms latency). Short bursts of GPU work just before a chunk do not help; sustained activity does. `--gpu-warm` keeps the GPU busy while waiting for audio and brings live chunks back to the fast-path time at a power cost, so it is off by default.
 
 ## Parity with MLX
 
@@ -61,6 +78,7 @@ The comparison covers the log-mel frames, every post-prompt encoder frame and th
 - `src/` C and Metal sources, `Makefile` builds `nemoasr-c` into the project root.
 - `tools/mlx_reference.py`, `tools/compare.py` parity tooling (run with the `~/fun/nemoasr` venv).
 - `bench/mlx_bench.py`, `bench/run_bench.py` benchmark harness; writes `bench/results.json` and `COMPARISON.md`.
+- `tools/kbench.c` (`make kbench`) kernel micro-benchmarks: dispatch overhead and GEMM variants against DRAM-resident weights. `NEMO_SKIP=<mask>` disables kernel categories to attribute chunk time (output is garbage while set).
 - `ref/` test clips (16 kHz plus 44.1/48 kHz variants) and MLX reference dumps.
 
 ## Notes from testing
