@@ -220,7 +220,7 @@ kernel void attention_rel(device const float *Q [[buffer(0)]],
     threadgroup float qu[ATT_DH], qv[ATT_DH], s[ATT_MAX_L];
     const uint h = tg.x, i = tg.y, dh = p.dh, D = p.D, L = p.L, off = h * dh;
     {
-        const float q = Q[(ulong)i * D + off + tid];
+        const float q = Q[(ulong)i * p.ldq + off + tid];
         qu[tid] = q + bias_u[off + tid];
         qv[tid] = q + bias_v[off + tid];
     }
@@ -229,7 +229,7 @@ kernel void attention_rel(device const float *Q [[buffer(0)]],
         const uint j = tid;
         /* relative position = (L - c + i) - j  ->  row in P (window L) = c-1-i+j, shifted by Lmax-L */
         const uint prow = (p.Lmax - L) + (p.c - 1 - i + j);
-        device const float4 *k4 = (device const float4 *)(K + (ulong)j * D + off);
+        device const float4 *k4 = (device const float4 *)(K + (ulong)j * p.ldk + off);
         device const float4 *p4 = (device const float4 *)(P + (ulong)prow * D + off);
         float a = 0.0f, b = 0.0f;
         for (uint d4 = 0; d4 < dh / 4; ++d4) {
@@ -249,7 +249,7 @@ kernel void attention_rel(device const float *Q [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float acc = 0.0f;
-    for (uint j = 0; j < L; ++j) acc += s[j] * V[(ulong)j * D + off + tid];
+    for (uint j = 0; j < L; ++j) acc += s[j] * V[(ulong)j * p.ldk + off + tid];
     O[(ulong)i * D + off + tid] = acc;
 }
 
@@ -400,14 +400,15 @@ kernel void joint_partial(device const float *enc [[buffer(0)]],
                           device float *part_v [[buffer(4)]],
                           device int *part_i [[buffer(5)]],
                           constant JointParams &p [[buffer(6)]],
-                          uint g [[threadgroup_position_in_grid]],
-                          uint G [[threadgroups_per_grid]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint2 Gs [[threadgroups_per_grid]],
                           uint tid [[thread_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float4 r4[JOINT_MAX_H / 4];
     threadgroup float *r = (threadgroup float *)r4;
-    device const float *e = enc + (ulong)p.enc_row * p.enc_ld;
+    const uint g = tg.x, G = Gs.x, row = tg.y; /* row: which encoder frame of the batch */
+    device const float *e = enc + (ulong)(p.enc_row + row) * p.enc_ld;
     for (uint i = tid; i < p.H; i += GEMM_SIMDS * 32) r[i] = max(e[i] + pred[i], 0.0f);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint H4 = p.H / 4;
@@ -420,7 +421,7 @@ kernel void joint_partial(device const float *enc [[buffer(0)]],
         acc = simd_sum(acc) + bias[n];
         if (acc > bv || (acc == bv && (int)n < bi)) { bv = acc; bi = (int)n; }
     }
-    if (lane == 0) { part_v[g * GEMM_SIMDS + sg] = bv; part_i[g * GEMM_SIMDS + sg] = bi; }
+    if (lane == 0) { part_v[row * G * GEMM_SIMDS + g * GEMM_SIMDS + sg] = bv; part_i[row * G * GEMM_SIMDS + g * GEMM_SIMDS + sg] = bi; }
 }
 
 /* RNNT joint, stage 2: reduce the partial bests. One threadgroup of 256. out[0] = index, out[1] = value bits. */
@@ -428,11 +429,15 @@ kernel void argmax_reduce(device const float *part_v [[buffer(0)]],
                           device const int *part_i [[buffer(1)]],
                           device int *out [[buffer(2)]],
                           constant CountParams &p [[buffer(3)]],
+                          uint row [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float bestv[256];
     threadgroup int besti[256];
     float bv = -INFINITY;
     int bi = 0x7fffffff;
+    part_v += (ulong)row * p.n;
+    part_i += (ulong)row * p.n;
+    out += 2 * row;
     for (uint i = tid; i < p.n; i += 256) {
         if (part_v[i] > bv || (part_v[i] == bv && part_i[i] < bi)) { bv = part_v[i]; bi = part_i[i]; }
     }

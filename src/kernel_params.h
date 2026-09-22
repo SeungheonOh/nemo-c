@@ -13,13 +13,15 @@ typedef uint32_t u32;
 #define ATT_DH 128       /* head dim = attention threadgroup size */
 #define JOINT_GROUPS 64  /* threadgroups for joint_partial */
 #define MMA_MIN_ROWS 16  /* activation buffers must hold this many rows for gemm_mma */
+#define CACHE_EPOCH_CHUNKS 8 /* k/v and conv caches are compacted once per this many max-size chunks */
+#define DEC_MAX_BATCH 16 /* joint evaluations batched per decoder round trip */
 #define ATT_MAX_L 80     /* max attention window (56 cache + 14 chunk, rounded) */
 #define LN_THREADS 256
 #define JOINT_MAX_H 640
 
 typedef struct { u32 M, N, K, lda, ldw, ldc, has_bias, act, accumulate; float alpha; } GemmParams; /* act: 0 none, 1 silu, 2 relu */
 typedef struct { u32 M, D; float eps; } LnParams;
-typedef struct { u32 c, L, Lmax, H, dh, D; float scale; } AttnParams;
+typedef struct { u32 c, L, Lmax, H, dh, D, ldq, ldk; float scale; } AttnParams;
 typedef struct { u32 M, D; } GluParams;
 typedef struct { u32 c, D, taps; float eps; } DwParams;
 typedef struct { u32 T, F, T1, F1, C; } Conv2dParams;

@@ -20,6 +20,7 @@ typedef struct { gpu_buf_t *buf; size_t off; } wt_t; /* bf16 weight location ins
 
 typedef struct {
     wt_t ff1_w1, ff1_w2, ff2_w1, ff2_w2, wq, wk, wv, wo, wpos, pw1, pw2;
+    wt_t wqkv; /* wq, wk, wv laid out consecutively in the arena: one [3D][D] matrix */
     gpu_buf_t *ln_ff1_g, *ln_ff1_b, *ln_att_g, *ln_att_b, *ln_conv_g, *ln_conv_b, *ln_ff2_g, *ln_ff2_b, *ln_out_g, *ln_out_b;
     gpu_buf_t *bn_g, *bn_b;   /* conv module LayerNorm (named batch_norm in the checkpoint) */
     gpu_buf_t *dw_w;          /* f32 [D][9] */

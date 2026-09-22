@@ -225,6 +225,8 @@ model_t *model_load(const char *dir, char *err, size_t errlen) {
         LN(ff1_w1, "feed_forward1.linear1.weight"); LN(ff1_w2, "feed_forward1.linear2.weight");
         LN(ff2_w1, "feed_forward2.linear1.weight"); LN(ff2_w2, "feed_forward2.linear2.weight");
         LN(wq, "self_attn.linear_q.weight"); LN(wk, "self_attn.linear_k.weight"); LN(wv, "self_attn.linear_v.weight");
+        if (L->wk.off != L->wq.off + D * D * 2 || L->wv.off != L->wk.off + D * D * 2) { snprintf(err, errlen, "qkv weights not contiguous in arena"); model_free(m); return NULL; }
+        L->wqkv = L->wq;
         LN(wo, "self_attn.linear_out.weight"); LN(wpos, "self_attn.linear_pos.weight");
         LN(pw1, "conv.pointwise_conv1.weight"); LN(pw2, "conv.pointwise_conv2.weight");
         LF(ln_ff1_g, "norm_feed_forward1.weight", D); LF(ln_ff1_b, "norm_feed_forward1.bias", D);

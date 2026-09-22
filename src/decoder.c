@@ -29,9 +29,9 @@ decoder_t *decoder_create(model_t *m) {
     d->x = gpu_buf_alloc(m->gpu, PH);
     d->gates = gpu_buf_alloc(m->gpu, 4 * PH);
     d->pred_out = gpu_buf_alloc(m->gpu, (size_t)m->cfg.joint_hidden * sizeof(float));
-    d->argmax = gpu_buf_alloc(m->gpu, 16);
-    d->part_v = gpu_buf_alloc(m->gpu, JOINT_GROUPS * GEMM_SIMDS * sizeof(float));
-    d->part_i = gpu_buf_alloc(m->gpu, JOINT_GROUPS * GEMM_SIMDS * sizeof(int));
+    d->argmax = gpu_buf_alloc(m->gpu, (size_t)DEC_MAX_BATCH * 2 * sizeof(int));
+    d->part_v = gpu_buf_alloc(m->gpu, (size_t)DEC_MAX_BATCH * JOINT_GROUPS * GEMM_SIMDS * sizeof(float));
+    d->part_i = gpu_buf_alloc(m->gpu, (size_t)DEC_MAX_BATCH * JOINT_GROUPS * GEMM_SIMDS * sizeof(int));
     for (int l = 0; l < 2; ++l) {
         d->h[l] = gpu_buf_alloc(m->gpu, PH); d->c[l] = gpu_buf_alloc(m->gpu, PH);
         d->hp[l] = gpu_buf_alloc(m->gpu, PH); d->cp[l] = gpu_buf_alloc(m->gpu, PH);
@@ -76,15 +76,17 @@ static void encode_pred(decoder_t *d) {
     k_gemm(m, d->hp[1], 0, PH, m->joint_pred_w, PH, m->joint_pred_b, d->pred_out, 0, JH, 1, JH, PH, 0, 0, 1.0f);
 }
 
-static void encode_argmax(decoder_t *d, gpu_buf_t *joint_enc, int row) {
+/* joint + argmax for `rows` consecutive encoder frames starting at `row`, all with the current
+   prediction vector (speculating that they decode to blank); results land in argmax[2*i] */
+static void encode_argmax(decoder_t *d, gpu_buf_t *joint_enc, int row, int rows) {
     model_t *m = d->m;
     JointParams jp = { (uint32_t)m->cfg.num_classes, (uint32_t)m->cfg.joint_hidden, (uint32_t)row, (uint32_t)m->cfg.joint_hidden };
     gpu_arg_t a1[7] = { GPU_BUF(joint_enc, 0), GPU_BUF(d->pred_out, 0), GPU_BUF(m->joint_out_w.buf, m->joint_out_w.off), GPU_BUF(m->joint_out_b, 0),
                         GPU_BUF(d->part_v, 0), GPU_BUF(d->part_i, 0), GPU_BYTES(&jp) };
-    gpu_dispatch_groups(m->gpu, "joint_partial", a1, 7, JOINT_GROUPS, 1, 1, GEMM_SIMDS * 32, 1, 1);
+    gpu_dispatch_groups(m->gpu, "joint_partial", a1, 7, JOINT_GROUPS, (uint32_t)rows, 1, GEMM_SIMDS * 32, 1, 1);
     CountParams cp = { JOINT_GROUPS * GEMM_SIMDS };
     gpu_arg_t a2[4] = { GPU_BUF(d->part_v, 0), GPU_BUF(d->part_i, 0), GPU_BUF(d->argmax, 0), GPU_BYTES(&cp) };
-    gpu_dispatch_groups(m->gpu, "argmax_reduce", a2, 4, 1, 1, 1, 256, 1, 1);
+    gpu_dispatch_groups(m->gpu, "argmax_reduce", a2, 4, (uint32_t)rows, 1, 1, 256, 1, 1);
 }
 
 int decoder_run(decoder_t *d, gpu_buf_t *joint_enc, int frames, int *out, int max_out, char *err, size_t errlen) {
@@ -93,14 +95,19 @@ int decoder_run(decoder_t *d, gpu_buf_t *joint_enc, int frames, int *out, int ma
     int n = 0, steps = 0;
     int t = 0, symbols = 0;
     while (t < frames) {
+        int rows = frames - t;
+        if (rows > DEC_MAX_BATCH) rows = DEC_MAX_BATCH;
         gpu_begin(m->gpu);
         if (!d->pred_valid) encode_pred(d);
-        encode_argmax(d, joint_enc, t);
+        encode_argmax(d, joint_enc, t, rows);
         if (gpu_end(m->gpu, err, errlen)) return -1;
         steps++;
         d->pred_valid = 1;
-        int pred = ((int *)gpu_buf_ptr(d->argmax))[0];
-        if (pred != m->cfg.blank_id) {
+        const int *res = gpu_buf_ptr(d->argmax);
+        int i = 0;
+        for (; i < rows; ++i) {
+            int pred = res[2 * i];
+            if (pred == m->cfg.blank_id) { symbols = 0; continue; } /* blank: frame t+i is done, next frame keeps the same prediction state */
             if (n < max_out) out[n++] = pred;
             d->last_token = pred;
             for (int l = 0; l < 2; ++l) { /* commit the provisional state by swapping buffers */
@@ -109,11 +116,10 @@ int decoder_run(decoder_t *d, gpu_buf_t *joint_enc, int frames, int *out, int ma
             }
             d->pred_valid = 0;
             symbols++;
-            if (symbols >= m->cfg.max_symbols) { t++; symbols = 0; }
-        } else {
-            t++;
-            symbols = 0;
+            if (symbols >= m->cfg.max_symbols) { symbols = 0; i++; } /* frame exhausted: move on */
+            break; /* later frames were scored with the old prediction state: redo them */
         }
+        t += i;
     }
     d->last_ms = now_ms() - t0;
     d->last_steps = steps;
