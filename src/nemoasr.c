@@ -176,8 +176,12 @@ int nemoasr_reset(nemoasr_t *s, const char *language, int latency_ms, char *err,
     if (nemoasr_prepare_latency(s, latency_ms, err, errlen)) return -1;
     if (language && model_set_language(s->m, language, err, errlen)) return -1;
     int right = right_for(latency_ms);
-    encoder_destroy(s->enc);
-    s->enc = encoder_create(s->m, right);
+    if (encoder_right(s->enc) == right) {
+        encoder_reset(s->enc);   /* same chunking: keep the GPU buffers, just empty the caches */
+    } else {
+        encoder_destroy(s->enc);
+        s->enc = encoder_create(s->m, right);
+    }
     mel_destroy(s->mel);
     s->mel = mel_create();
     decoder_reset(s->dec);

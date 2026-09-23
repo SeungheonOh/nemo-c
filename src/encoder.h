@@ -14,6 +14,10 @@ typedef struct {
 
 encoder_t *encoder_create(model_t *m, int right_context);
 void encoder_destroy(encoder_t *e);
+/* Back to the state right after encoder_create, keeping the GPU buffers: pending mel dropped,
+   caches emptied, counters zeroed. Same right context only. */
+void encoder_reset(encoder_t *e);
+int encoder_right(const encoder_t *e);
 int encoder_chunk_frames(const encoder_t *e);
 int encoder_chunk_mel(const encoder_t *e);
 /* queue mel frames (MEL_NMEL floats each) */

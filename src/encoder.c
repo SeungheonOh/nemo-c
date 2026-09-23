@@ -89,6 +89,19 @@ void encoder_destroy(encoder_t *e) {
     free(e->pending);
     free(e);
 }
+void encoder_reset(encoder_t *e) {
+    e->pending_n = 0;
+    e->mel_cache_n = 0;
+    e->consumed = e->emitted = 0;
+    e->closed = 0;
+    e->cache_len = 0;
+    e->pos = e->conv_left;
+    /* rows [0, conv_left) of each conv cache must read as zeros again; the buffers are shared
+       storage and no command buffer is in flight between steps */
+    const size_t rowb = (size_t)e->m->cfg.d_model * sizeof(float);
+    for (int l = 0; l < e->m->cfg.n_layers; ++l) memset(gpu_buf_ptr(e->din[l]), 0, (size_t)e->conv_left * rowb);
+}
+int encoder_right(const encoder_t *e) { return e->right; }
 int encoder_chunk_frames(const encoder_t *e) { return e->chunk_frames; }
 int encoder_chunk_mel(const encoder_t *e) { return e->chunk_mel; }
 
