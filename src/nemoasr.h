@@ -38,6 +38,16 @@ void nemoasr_close(nemoasr_t *s);
 char *nemoasr_feed(nemoasr_t *s, const float *samples, size_t n, int final, char *err, size_t errlen);
 void nemoasr_free(char *text);
 
+/* Start a fresh stream on the same loaded model: drops all streaming state (encoder caches,
+   decoder state, buffered audio, pending text, the finished flag) and switches the language prompt
+   and chunk latency. Audio not yet decoded is discarded; call nemoasr_feed(..., final=1) first to
+   flush it. Takes microseconds unless the latency's kernels were never compiled (see below). */
+int nemoasr_reset(nemoasr_t *s, const char *language, int latency_ms, char *err, size_t errlen);
+
+/* Compile and warm the kernels for another latency ahead of time, so a later nemoasr_reset to it
+   does not pause the stream. */
+int nemoasr_prepare_latency(nemoasr_t *s, int latency_ms, char *err, size_t errlen);
+
 double nemoasr_load_ms(const nemoasr_t *s);           /* model load + warm-up */
 const char *nemoasr_gpu_name(const nemoasr_t *s);
 int nemoasr_latency_ms(const nemoasr_t *s);

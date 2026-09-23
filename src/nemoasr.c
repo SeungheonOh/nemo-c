@@ -25,6 +25,7 @@ struct nemoasr {
     mel_state_t *mel;
     resampler_t *rs;
     int input_rate, latency_ms, finished, printed_any;
+    unsigned warmed; /* bit r set: kernels for right context r are compiled */
     float *tmp;
     size_t tmp_cap;
     char *text;
@@ -57,10 +58,14 @@ int nemoasr_default_model_dir(char *out, size_t n) {
 static const int LAT_MS[] = { 80, 160, 320, 560, 1120 };
 static const int LAT_R[] = { 0, 1, 3, 6, 13 };
 
+static int right_for(int latency_ms) {
+    for (size_t i = 0; i < sizeof LAT_MS / sizeof *LAT_MS; ++i) if (LAT_MS[i] == latency_ms) return LAT_R[i];
+    return -1;
+}
+
 nemoasr_t *nemoasr_open(const char *model_dir, const char *language, int latency_ms, int input_rate, char *err, size_t errlen) {
     if (errlen) err[0] = 0;
-    int right = -1;
-    for (size_t i = 0; i < sizeof LAT_MS / sizeof *LAT_MS; ++i) if (LAT_MS[i] == latency_ms) right = LAT_R[i];
+    int right = right_for(latency_ms);
     if (right < 0) { snprintf(err, errlen, "latency must be one of 80, 320, 560, 1120 ms"); return NULL; }
     if (input_rate <= 0) { snprintf(err, errlen, "input_rate must be positive"); return NULL; }
     double t0 = now_ms();
@@ -70,6 +75,7 @@ nemoasr_t *nemoasr_open(const char *model_dir, const char *language, int latency
     if (!model_right_context_trained(s->m, right)) { snprintf(err, errlen, "latency %d ms not trained for this checkpoint", latency_ms); nemoasr_close(s); return NULL; }
     if (model_set_language(s->m, language ? language : "auto", err, errlen)) { nemoasr_close(s); return NULL; }
     asr_warmup(s->m, right, err, errlen);
+    s->warmed = 1u << right;
     s->enc = encoder_create(s->m, right);
     s->dec = decoder_create(s->m);
     s->mel = mel_create();
@@ -151,6 +157,38 @@ char *nemoasr_feed(nemoasr_t *s, const float *samples, size_t n, int final, char
     s->text = NULL;
     s->text_len = s->text_cap = 0;
     return out;
+}
+
+int nemoasr_prepare_latency(nemoasr_t *s, int latency_ms, char *err, size_t errlen) {
+    if (errlen) err[0] = 0;
+    int right = right_for(latency_ms);
+    if (right < 0) { snprintf(err, errlen, "latency must be one of 80, 320, 560, 1120 ms"); return -1; }
+    if (!model_right_context_trained(s->m, right)) { snprintf(err, errlen, "latency %d ms not trained for this checkpoint", latency_ms); return -1; }
+    if (!(s->warmed & (1u << right))) {
+        asr_warmup(s->m, right, err, errlen);
+        s->warmed |= 1u << right;
+    }
+    return 0;
+}
+
+int nemoasr_reset(nemoasr_t *s, const char *language, int latency_ms, char *err, size_t errlen) {
+    if (errlen) err[0] = 0;
+    if (nemoasr_prepare_latency(s, latency_ms, err, errlen)) return -1;
+    if (language && model_set_language(s->m, language, err, errlen)) return -1;
+    int right = right_for(latency_ms);
+    encoder_destroy(s->enc);
+    s->enc = encoder_create(s->m, right);
+    mel_destroy(s->mel);
+    s->mel = mel_create();
+    decoder_reset(s->dec);
+    if (s->rs) { resampler_destroy(s->rs); s->rs = resampler_create(s->input_rate, MEL_SR); }
+    free(s->text);
+    s->text = NULL;
+    s->text_len = s->text_cap = 0;
+    s->finished = 0;
+    s->printed_any = 0;
+    s->latency_ms = latency_ms;
+    return 0;
 }
 
 void nemoasr_free(char *text) { free(text); }
