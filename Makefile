@@ -1,7 +1,8 @@
 CC      := clang
-CFLAGS  := -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Isrc -Ibuild -MMD -MP
-OBJCFLAGS := -O2 -fobjc-arc -Wall -Wno-deprecated-declarations -Isrc -Ibuild -MMD -MP
-LDFLAGS := -framework Metal -framework Foundation -framework AudioToolbox -framework CoreAudio -framework CoreFoundation -lm
+MIN_MACOS ?= 14.0
+CFLAGS  := -O2 -std=c11 -mmacosx-version-min=$(MIN_MACOS) -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Isrc -Ibuild -MMD -MP
+OBJCFLAGS := -O2 -fobjc-arc -mmacosx-version-min=$(MIN_MACOS) -Wall -Wno-deprecated-declarations -Isrc -Ibuild -MMD -MP
+LDFLAGS := -mmacosx-version-min=$(MIN_MACOS) -framework Metal -framework Foundation -framework AudioToolbox -framework CoreAudio -framework CoreFoundation -lm
 
 SRC_C := src/main.c src/json.c src/safetensors.c src/wav.c src/tokenizer.c src/mel.c src/model.c src/encoder.c src/decoder.c src/mic.c src/resample.c src/warmup.c src/nemoasr.c
 LIB_SRC := src/json.c src/safetensors.c src/tokenizer.c src/mel.c src/model.c src/encoder.c src/decoder.c src/resample.c src/warmup.c src/nemoasr.c
