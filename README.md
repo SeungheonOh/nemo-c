@@ -63,6 +63,19 @@ Pipelines for every row count 1..16 are compiled during warm-up so no chunk pays
 
 Between chunks the GPU idles and clocks down, so at real time a chunk takes about twice its fast-path time (14 vs 6 ms at 560 ms latency). Short bursts of GPU work just before a chunk do not help; sustained activity does. `--gpu-warm` keeps the GPU busy while waiting for audio and brings live chunks back to the fast-path time at a power cost, so it is off by default.
 
+## Embedding: the library
+
+`make lib` builds `build/libnemoasr.a` (everything except the CLI and CoreAudio capture). The interface is `src/nemoasr.h`:
+
+```c
+nemoasr_t *s = nemoasr_open(model_dir, "auto", 560, 48000, err, sizeof err); /* ~300 ms incl. warm-up */
+char *text = nemoasr_feed(s, samples, n, /*final*/ 0, err, sizeof err);      /* any input rate; returns new text or NULL */
+nemoasr_free(text);
+nemoasr_close(s);
+```
+
+Link with `-framework Metal -framework Foundation`. `make libtest && ./libtest ref/fox48k.wav` exercises it the way an app would. The Swift menu-bar app in `../nemo-gui` is built on this.
+
 ## Parity with MLX
 
 ```bash
@@ -75,7 +88,7 @@ The comparison covers the log-mel frames, every post-prompt encoder frame and th
 
 ## Layout
 
-- `src/` C and Metal sources, `Makefile` builds `nemoasr-c` into the project root.
+- `src/` C and Metal sources, `Makefile` builds `nemoasr-c` into the project root; `make lib` builds `build/libnemoasr.a` for embedding (`src/nemoasr.h`).
 - `tools/mlx_reference.py`, `tools/compare.py` parity tooling (run with the `~/fun/nemoasr` venv).
 - `bench/mlx_bench.py`, `bench/run_bench.py` benchmark harness; writes `bench/results.json` and `COMPARISON.md`.
 - `tools/kbench.c` (`make kbench`) kernel micro-benchmarks: dispatch overhead and GEMM variants against DRAM-resident weights. `NEMO_SKIP=<mask>` disables kernel categories to attribute chunk time (output is garbage while set).
